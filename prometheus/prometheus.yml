@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 5s
+  # має бути не більшим за scrape_interval
+  scrape_timeout: 4s
+
+scrape_configs:
+  # усі екземпляри web: DNS-запит за іменем сервісу повертає адреси всіх контейнерів
+  - job_name: web
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names: [web]
+        type: A
+        port: 8000
+        refresh_interval: 5s
+
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]

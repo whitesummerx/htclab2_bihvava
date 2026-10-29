@@ -1,0 +1,114 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: appointments_db
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Postgres password must be provided in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-appointments_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-appointments_db}"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+    networks:
+      - internal_network
+
+  migration:
+    image: postgres:16-alpine
+    container_name: appointments_migration
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Postgres password must be provided in .env}
+    volumes:
+      - ./db/init.sql:/init.sql:ro
+    entrypoint: >
+      sh -c "psql -h db -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-appointments_db} -f /init.sql"
+    networks:
+      - internal_network
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER:-postgres}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?Postgres password must be provided in .env}
+      DB_NAME: ${POSTGRES_DB:-appointments_db}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+    # на docker stop сервіс встигає дообробити запити; має бути більше за timeout_graceful_shutdown
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    healthcheck:
+      # без curl і wget: перевіряємо /healthz інтерпретатором із образу
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    networks:
+      - internal_network
+
+  lb:
+    image: nginx:alpine
+    container_name: appointments_lb
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      web:
+        condition: service_healthy
+    networks:
+      - internal_network
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: appointments_prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - internal_network
+
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
+    container_name: appointments_pg_exporter
+    environment:
+      DATA_SOURCE_URI: db:5432/${POSTGRES_DB:-appointments_db}?sslmode=disable
+      DATA_SOURCE_USER: ${POSTGRES_USER:-postgres}
+      DATA_SOURCE_PASS: ${POSTGRES_PASSWORD:?Postgres password must be provided in .env}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - internal_network
+
+volumes:
+  postgres_data:
+  prometheus_data:
+
+networks:
+  internal_network:
+    driver: bridge

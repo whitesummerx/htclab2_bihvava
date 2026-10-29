@@ -1,0 +1,13 @@
+# Секрети: пароль лежить лише тут
+.env
+
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
