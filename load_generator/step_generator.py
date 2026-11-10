@@ -55,6 +55,30 @@ STATUS_CONN = 0      # у записах: помилка зʼєднання
 # --------------------------------------------------------------------------- #
 # Допоміжні функції
 # --------------------------------------------------------------------------- #
+def pin_to_cpus(cpus):
+    """Прив'язує поточний процес до заданих логічних ядер (нумерація з 0). Повертає True, якщо вдалося."""
+    if not cpus:
+        return False
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            mask = 0
+            for c in cpus:
+                mask |= 1 << c
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            k32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            k32.SetProcessAffinityMask.restype = ctypes.c_int
+            ok = bool(k32.SetProcessAffinityMask(k32.GetCurrentProcess(), mask))
+            if not ok:
+                print(f"SetProcessAffinityMask: помилка {ctypes.get_last_error()} (маска {mask:#x}, ядер у системі {os.cpu_count()})")
+            return ok
+        os.sched_setaffinity(0, set(cpus))
+        return True
+    except Exception:
+        return False
+
+
 def percentile(sorted_vals, p):
     """Перцентиль p (0..100) з лінійною інтерполяцією для відсортованого списку."""
     if not sorted_vals:
@@ -119,6 +143,20 @@ def segment(j, cfg):
             float(cfg["start_rps"] + k * cfg["step_rps"]))
 
 
+def parse_cpus(text):
+    """'4,5' або '4-5' -> [4, 5]; порожній рядок -> []."""
+    out = []
+    for part in (text or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-")
+            out.extend(range(int(a), int(b) + 1))
+        else:
+            out.append(int(part))
+    return out
+
+
 def target_of_step(k, cfg):
     return cfg["start_rps"] + k * cfg["step_rps"]
 
@@ -153,6 +191,7 @@ class Worker:
         self.records = []   # (заплановано, відправлено, завершено, код, вид помилки), с від старту
         self.lags = []      # запізнення планувальника, мс
         self.idle = []      # вільні зʼєднання (keep-alive)
+        self.cpu_samples = []  # (секунда від старту, накопичений процесорний час процесу, с)
         self.kinds = {}
         self.t0 = 0.0
 
@@ -257,10 +296,15 @@ class Worker:
 
         gen = planned_times(cfg, self.proc, self.procs)
         nxt = next(gen)
+        next_cpu_sample = 0.0
         tasks = set()
         loop = asyncio.get_running_loop()
         while not self.stop_flag.value:
             now = time.perf_counter() - self.t0
+            if now >= next_cpu_sample:
+                # процесорний час самого процесу генератора, щоб потім взяти його за 15 с потрібної сходинки
+                self.cpu_samples.append((now, time.process_time()))
+                next_cpu_sample = now + 1.0
             launched = 0
             while nxt <= now and launched < 200:
                 lag_ms = (now - nxt) * 1000.0
@@ -280,12 +324,14 @@ class Worker:
                 conn[1].close()
             except Exception:
                 pass
+        self.cpu_samples.append((time.perf_counter() - self.t0, time.process_time()))
         return {"proc": self.proc, "records": self.records, "lags": self.lags,
-                "cpu_s": time.process_time()}
+                "cpu_s": time.process_time(), "cpu_samples": self.cpu_samples}
 
 
 def _worker_main(cfg, proc, procs, ok_counts, stop_flag, start_wall, conn):
     try:
+        pin_to_cpus(cfg.get("cpus"))
         if sys.platform == "win32":
             try:  # точність таймера 1 мс замість 15,6 мс
                 import ctypes
@@ -315,14 +361,18 @@ def build_requests(args, target):
 
 def run_profile(args, target):
     u = urlparse(args.base)
-    procs = args.procs or (os.cpu_count() or 1)
+    procs = args.procs or (len(parse_cpus(args.cpus)) or os.cpu_count() or 1)
     cfg = {
         "host": u.hostname, "port": u.port or 80,
         "requests": build_requests(args, target),
         "warmup": args.warmup, "step_s": args.step_seconds,
         "start_rps": args.start_rps, "step_rps": args.step_rps,
         "timeout": args.timeout,
+        "cpus": parse_cpus(args.cpus),
     }
+    pinned = pin_to_cpus(cfg["cpus"])
+    if cfg["cpus"]:
+        print(f"Генератор прив'язано до ядер {cfg['cpus']}: {'так' if pinned else 'НЕ ВДАЛОСЯ'}")
     ctx = get_context("spawn")
     ok_arrays = [ctx.Array("i", MAX_SECONDS, lock=False) for _ in range(procs)]
     stop_flag = ctx.Value("b", 0, lock=False)
@@ -390,6 +440,16 @@ def run_profile(args, target):
     return cfg, procs, start_wall, steps_done, stop_reason, results
 
 
+def _interp_cpu(samples, t):
+    """Накопичений процесорний час процесу в момент t (лінійна інтерполяція між відліками)."""
+    if t <= samples[0][0]:
+        return samples[0][1]
+    for (t0, c0), (t1, c1) in zip(samples, samples[1:]):
+        if t0 <= t <= t1:
+            return c0 + (c1 - c0) * (t - t0) / (t1 - t0) if t1 > t0 else c1
+    return samples[-1][1]
+
+
 def analyze(args, cfg, steps_done, results):
     warm, step_s, tr = args.warmup, args.step_seconds, args.transient
     nsec = int(warm + steps_done * step_s)
@@ -444,8 +504,16 @@ def analyze(args, cfg, steps_done, results):
         n_non = sum(non_n[s] for s in win)
         target = target_of_step(k, cfg)
         mean = statistics.fmean(ach)
+        # CPU процесів генератора за ці самі 15 с: сума приростів процесорного часу / тривалість вікна
+        gen_cpu = 0.0
+        for res in results:
+            cs = res["cpu_samples"]
+            gen_cpu += _interp_cpu(cs, b) - _interp_cpu(cs, a)
+        gen_cpu /= (b - a)
         steps.append({
             "step": k + 1, "target_rps": target,
+            "generator_cpu_cores": round(gen_cpu, 3),
+            "sent_to_target": round(statistics.fmean(sent_n[s] for s in win) / target, 4),
             "window_from_s": a, "window_to_s": b,
             "sent_rps_mean": round(statistics.fmean(sent_n[s] for s in win), 2),
             "achieved_rps_mean": round(mean, 2),
@@ -460,6 +528,7 @@ def analyze(args, cfg, steps_done, results):
         })
 
     best = max(steps, key=lambda s: s["achieved_rps_mean"])
+    sent_ok = all(abs(st["sent_to_target"] - 1.0) <= 0.005 for st in steps)
     lags = sorted(x for r in results for x in r["lags"])
     summary = {
         "X": best["achieved_rps_mean"],
@@ -473,16 +542,20 @@ def analyze(args, cfg, steps_done, results):
         "sched_lag_p99_ms": None if not lags else round(percentile(lags, 99), 2),
         "sched_lag_max_ms": None if not lags else round(lags[-1], 2),
         "conn_error_kinds": err_kinds,
+        # перевірка межі G: на кожній сходинці надіслано стільки, скільки задано (допуск 0,5 %)
+        "sent_equals_target_all_steps": sent_ok,
+        "generator_cpu_cores_X_step": best["generator_cpu_cores"],
+        "generator_cpus": cfg.get("cpus"),
         # процесорний час усіх процесів генератора, поділений на тривалість прогону
         "generator_cpu_cores_avg": round(
-            sum(r["cpu_s"] for r in results) / (warm + steps_done * step_s), 2),
+            sum(r["cpu_s"] for r in results) / (warm + steps_done * step_s), 2),   # лише за весь прогін; для звіту — generator_cpu_cores_X_step
     }
     return seconds, steps, summary
 
 
 def cmd_run(args):
     target = args.target
-    label = "step_noop" if target == "noop" else f"step_{args.instances}web"
+    label = args.label or ("step_noop" if target == "noop" else f"step_{args.instances}web")
     path = os.path.join(RESULTS_DIR, f"{label}.json")
     if os.path.exists(path) and not args.force:
         raise SystemExit(f"{label}: файл уже є (--force, щоб перезняти)")
@@ -500,7 +573,7 @@ def cmd_run(args):
             "warmup_s": args.warmup, "step_s": args.step_seconds,
             "transient_s": args.transient, "start_rps": args.start_rps,
             "step_rps": args.step_rps, "timeout_s": args.timeout, "processes": procs,
-            "g_limit": args.g_limit, "max_rps": args.max_rps,
+            "g_limit": args.g_limit, "max_rps": args.max_rps, "cpus": cfg.get("cpus"),
             "cpu_count": os.cpu_count(), "platform": platform.platform(),
             "python": platform.python_version(),
         },
@@ -522,12 +595,13 @@ def cmd_run(args):
         wr.writerows(seconds)
 
     print(f"\nПричина зупинки: {stop_reason}")
-    print("| Сходинка | Задано | Надіслано | Досягнуто | σ | досягнуто/задано | не-2xx, % | помилок зʼєднання | p50 | p95 | p99, мс |")
-    print("|---|---|---|---|---|---|---|---|---|---|---|")
+    print("| Сходинка | Задано | Надіслано | Досягнуто | σ | досягнуто/задано | не-2xx, % | помилок зʼєднання | p50 | p95 | p99, мс | CPU генератора, ядер |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|---|")
     for s in steps:
         print(f"| {s['step']} | {s['target_rps']} | {s['sent_rps_mean']} | {s['achieved_rps_mean']} "
               f"| {s['achieved_rps_std']} | {s['achieved_to_target']} | {s['non2xx_share_pct']} "
-              f"| {s['n_conn_errors']} | {s['client_p50_ms']} | {s['client_p95_ms']} | {s['client_p99_ms']} |")
+              f"| {s['n_conn_errors']} | {s['client_p50_ms']} | {s['client_p95_ms']} | {s['client_p99_ms']} "
+              f"| {s['generator_cpu_cores']} |")
     print(f"\nX = {summary['X']} req/s (σ = {summary['X_std']}), сходинка {summary['X_step']} "
           f"(задано {summary['X_step_target_rps']})")
     if target == "noop":
@@ -537,7 +611,15 @@ def cmd_run(args):
             print("УВАГА: на останній сходинці досягнуто не менше 0,9 заданої: точка обмежена генератором.")
         if summary["X_ge_0_9_g"]:
             print("УВАГА: X(N) >= 0,9·G: точка обмежена генератором.")
-    print(f"Генератор використав у середньому {summary['generator_cpu_cores_avg']} ядра CPU.")
+    print(f"CPU генератора на сходинці X: {summary['generator_cpu_cores_X_step']} ядра "
+          f"(за весь прогін у середньому {summary['generator_cpu_cores_avg']}).")
+    if summary["sent_equals_target_all_steps"]:
+        print("Перевірка G: надіслано = задано на всіх сходинках (допуск 0,5 %).")
+    else:
+        bad = [f"{st['step']}: {st['sent_rps_mean']} з {st['target_rps']}" for st in steps
+               if abs(st["sent_to_target"] - 1.0) > 0.005]
+        print("УВАГА: генератор відстав від розкладу на сходинках (надіслано з заданого): " + "; ".join(bad))
+        print("       дайте генератору більше окремих ядер (--cpus) або зменште --procs.")
     lag = summary["sched_lag_p99_ms"]
     if lag is not None and lag > 5:
         print(f"УВАГА: запізнення планувальника p99 = {lag} мс (>5 мс): генератор або хост перевантажені.")
@@ -566,7 +648,11 @@ def build_parser():
     r.add_argument("--step-rps", type=int, default=200)
     r.add_argument("--max-rps", type=int, default=12000, help="запобіжник")
     r.add_argument("--timeout", type=float, default=5.0, help="тайм-аут запиту, с")
-    r.add_argument("--procs", type=int, default=0, help="кількість процесів (типово: ядра)")
+    r.add_argument("--procs", type=int, default=0,
+                   help="кількість процесів (типово: кількість ядер з --cpus, а без нього — усі ядра)")
+    r.add_argument("--cpus", default="",
+                   help="логічні ядра, до яких прив'язати генератор, напр. 4,5 (нумерація з 0); окремо від ядер стенда")
+    r.add_argument("--label", default="", help="мітка результату (типово step_<N>web або step_noop)")
     r.add_argument("--force", action="store_true", help="перезаписати наявний результат")
     r.set_defaults(func=cmd_run)
     return p

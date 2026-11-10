@@ -1,0 +1,1 @@
+﻿docker inspect --format '{{.State.ExitCode}}' hpc_lab2-web-2  ->  0

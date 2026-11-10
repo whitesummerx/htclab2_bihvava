@@ -1,3 +1,4 @@
+import logging
 import socket
 import time
 
@@ -5,6 +6,8 @@ from prometheus_client import Counter, Gauge, Histogram
 from starlette.datastructures import MutableHeaders
 
 from app.config import settings
+
+logger = logging.getLogger("uvicorn.error")
 
 # Ім'я екземпляра: POD_NAME, а якщо змінну не задано - ім'я хоста контейнера
 POD_NAME = settings.POD_NAME or socket.gethostname()
@@ -45,10 +48,12 @@ class MetricsMiddleware:
         # Сам збір метрик у статистику не входить
         measured = scope["path"] != "/metrics"
         status_code = 500
+        started_response = False
 
         async def send_wrapper(message):
-            nonlocal status_code
+            nonlocal status_code, started_response
             if message["type"] == "http.response.start":
+                started_response = True
                 status_code = message["status"]
                 MutableHeaders(scope=message)["X-Pod"] = POD_NAME
             await send(message)
@@ -60,7 +65,20 @@ class MetricsMiddleware:
         REQUESTS_IN_PROGRESS.inc()
         started = time.perf_counter()
         try:
-            await self.app(scope, receive, send_wrapper)
+            try:
+                await self.app(scope, receive, send_wrapper)
+            except Exception:
+                # Необроблений виняток: ServerErrorMiddleware стоїть ЗОВНІ цього обробника і сформував би
+                # відповідь 500 без X-Pod. Тому відповідь 500 формуємо тут, усередині, з тим самим заголовком.
+                logger.exception("Необроблений виняток під час %s %s", scope.get("method"), scope.get("path"))
+                if started_response:
+                    raise  # заголовки вже відправлено: лишається розірвати зʼєднання
+                status_code = 500
+                body = b'{"detail":"Internal Server Error"}'
+                await send_wrapper({"type": "http.response.start", "status": 500,
+                                    "headers": [(b"content-type", b"application/json"),
+                                                (b"content-length", str(len(body)).encode())]})
+                await send_wrapper({"type": "http.response.body", "body": body})
         finally:
             elapsed = time.perf_counter() - started
             REQUESTS_IN_PROGRESS.dec()

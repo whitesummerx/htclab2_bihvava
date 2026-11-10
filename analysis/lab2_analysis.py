@@ -2,11 +2,12 @@
 """Лаб. 2 (варіант 3): аналіз прогонів. Лише stdlib + matplotlib.
 
 Запуск:  python lab2_analysis.py [--data data] [--out out] [--pool 10]
-Вхід:    step_<N>web.json, prom_<N>web.json, docker_stats_4web.txt (опційно)
+Вхід:    step_<N>web.json, prom_<N>web.json, step_noop.json, docker_stats_4web.txt і host_cpu_4web.txt
+         (останні два — з ТОГО САМОГО прогону N=4, що й step_4web.json; їхній час перевіряється)
 Вихід:   out/*.png, out/summary.json, out/tables.md
 """
 import argparse, bisect, json, math, re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib
@@ -36,6 +37,15 @@ def inc(series, t0, t1):
 
 def web(series):
     return [r["values"] for r in series if r["metric"].get("job") == "web"]
+
+
+def by_instance(rows):
+    """{instance: [values, ...]} для рядів job=web (кілька рядів одного instance сумуються)."""
+    out = {}
+    for r in rows:
+        if r["metric"].get("job") == "web":
+            out.setdefault(r["metric"]["instance"], []).append(r["values"])
+    return dict(sorted(out.items()))
 
 
 def quantile(prom, t0, t1, q=0.99):
@@ -83,8 +93,8 @@ def gauge_mean(series, t0, t1):
 
 # ---------------------------------------------------------------- per-run
 def analyse_run(n, data, pool):
-    s = json.load(open(data / f"step_{n}web.json"))
-    p = json.load(open(data / f"prom_{n}web.json"))
+    s = json.load(open(data / f"step_{n}web.json", encoding="utf-8"))
+    p = json.load(open(data / f"prom_{n}web.json", encoding="utf-8"))
     t_start = s["start_epoch"]
     cpu = web(p["series"]["cpu_seconds"])
     req = web(p["series"]["requests_total"])
@@ -96,9 +106,7 @@ def analyse_run(n, data, pool):
         dt = b - a
         cores = [(interp(c, b) - interp(c, a)) / dt for c in cpu]
         dreq = inc(req, a, b)
-        q = quantile(p, a, b)
-        if q is not None and dreq / dt < 0.5 * st["target_rps"]:
-            q = None            # сервер обробив <50% заданого — гістограма не репрезентативна
+        q = quantile(p, a, b)   # без відкидання сходинок: оцінка за приростами бакетів є завжди, коли були відповіді
         ig = gauge_mean(inprog, a, b)
         rows.append(dict(
             step=st["step"], target=st["target_rps"], achieved=st["achieved_rps_mean"],
@@ -109,6 +117,9 @@ def analyse_run(n, data, pool):
             srv_lo=None if q is None else q[1] * 1000,
             srv_hi=None if q is None else (None if q[2] == math.inf else q[2] * 1000),
             srv_open=False if q is None else q[3],
+            srv_err=None if q is None or q[3] else (q[2] - q[1]) * 1000,   # похибка = ширина бакета b(i) - b(i-1)
+            sent=st.get("sent_rps_mean"), sent_ratio=st.get("sent_to_target"),
+            gen_cpu=st.get("generator_cpu_cores"),
             srv_rps=dreq / dt,
             cpu_per_inst=sum(cores) / max(len(cores), 1), cpu_max=max(cores), cpu_sum=sum(cores),
             cpu_ms_per_req=(sum(cores) * dt / dreq * 1000) if dreq > 50 else None,
@@ -126,21 +137,30 @@ def x_of(s):
 
 # ---------------------------------------------------------------- USL
 def usl_fit(Ns, Cs):
-    """C(N)=N/(1+s(N-1)+k N(N-1)); МНК за лінеаризацією N/C-1 = s(N-1)+k N(N-1)."""
-    y = [n / c - 1 for n, c in zip(Ns, Cs)]
-    a1 = [n - 1 for n in Ns]; a2 = [n * (n - 1) for n in Ns]
-    s11 = sum(x * x for x in a1); s12 = sum(x * z for x, z in zip(a1, a2)); s22 = sum(z * z for z in a2)
-    b1 = sum(x * v for x, v in zip(a1, y)); b2 = sum(z * v for z, v in zip(a2, y))
-    det = s11 * s22 - s12 ** 2
-    sg, kp = (b1 * s22 - b2 * s12) / det, (s11 * b2 - s12 * b1) / det
+    """C(N)=N/(1+s(N-1)+k N(N-1)); МНК за лінеаризацією y = s*u + k*v,
+    y = N/C - 1, u = N - 1, v = N(N-1). Нормальні рівняння:
+        s*Σu² + k*Σuv = Σuy,   s*Σuv + k*Σv² = Σvy.
+    Повертає (σ, κ, N*, примітка, деталі для звіту)."""
+    pts = [(n, c) for n, c in zip(Ns, Cs) if n > 1]          # N=1 дає u=v=y=0 і нічого не додає
+    rows = [dict(N=n, C=c, y=n / c - 1, u=n - 1, v=n * (n - 1)) for n, c in pts]
+    S = dict(uu=sum(r["u"] ** 2 for r in rows), vv=sum(r["v"] ** 2 for r in rows),
+             uv=sum(r["u"] * r["v"] for r in rows), uy=sum(r["u"] * r["y"] for r in rows),
+             vy=sum(r["v"] * r["y"] for r in rows))
+    det = S["uu"] * S["vv"] - S["uv"] ** 2
+    sg = (S["uy"] * S["vv"] - S["vy"] * S["uv"]) / det
+    kp = (S["uu"] * S["vy"] - S["uv"] * S["uy"]) / det
     note = "двопараметрична"
+    sg2, kp2 = sg, kp
     if kp < 0:
-        kp, note = 0.0, "κ<0 → κ=0, лише σ (формула Амдала)"
-        sg = b1 / s11
-    if sg < 0:
-        sg, note = 0.0, note + "; σ<0 → 0"
-    nstar = math.sqrt((1 - sg) / kp) if kp > 0 else math.inf
-    return sg, kp, nstar, note
+        kp2, note = 0.0, "κ<0 → κ=0, σ перераховано лише за u"
+        sg2 = S["uy"] / S["uu"]
+    if sg2 < 0:
+        sg2, note = 0.0, note + "; σ<0 → σ=0"
+        kp2 = max(S["vy"] / S["vv"], 0.0)
+        if kp >= 0:
+            note = "σ<0 → σ=0, κ перераховано лише за v"
+    nstar = math.sqrt((1 - sg2) / kp2) if kp2 > 0 else math.inf
+    return sg2, kp2, nstar, note, dict(rows=rows, S=S, det=det, sg_raw=sg, kp_raw=kp)
 
 
 def usl(n, sg, kp):
@@ -150,7 +170,9 @@ def usl(n, sg, kp):
 # ---------------------------------------------------------------- docker stats
 def parse_stats(path):
     out, cur = [], None
-    for line in open(path, encoding="utf-8"):
+    raw = Path(path).read_bytes()
+    text = raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode("utf-8-sig")
+    for line in text.splitlines():
         line = line.strip()
         if re.match(r"\d{4}-\d\d-\d\dT", line):
             cur = dict(t=datetime.fromisoformat(line).timestamp(), cpu={}, mem={})
@@ -208,30 +230,52 @@ def plot_profile(n, s, p, rows, out):
 
 
 def plot_timeline(n, s, p, out):
-    sec = s["seconds"]; t0 = s["start_epoch"]
+    """Прогін по секундах. Панелі на спільній осі часу:
+    1) задано / надіслано / 2xx / не-2xx; 2) p99 клієнта і p99 сервера (вікно 15 с, оновлення кожні 5 с);
+    3) CPU кожного інстанса; 4) запити/с кожного інстанса (приріст http_requests_total);
+    5) запити в обробці кожного інстанса (http_requests_in_progress)."""
+    sec = s["seconds"]; t0 = s["start_epoch"]; T = len(sec)
     t = [r["second"] for r in sec]
-    fig, ax = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
+    fig, ax = plt.subplots(5, 1, figsize=(11, 15), sharex=True)
     ax[0].plot(t, [r["target_rps"] for r in sec], color="#9a9993", ls="--", lw=1, label="задано")
+    ax[0].plot(t, [r["sent_rps"] for r in sec], color=C3, lw=1.0, label="надіслано/с")
     ax[0].plot(t, [r["achieved_rps"] for r in sec], color=C1, lw=1.6, label="2xx/с")
     ax[0].plot(t, [r["n_non2xx"] + r["n_conn_errors"] for r in sec], color=C2, lw=1.2, label="не-2xx + помилки з'єднання /с")
-    ax[0].set_ylabel("req/s"); ax[0].legend(frameon=False, ncol=3, fontsize=8); ax[0].set_title(f"N={n}: по секундах")
-    ax[1].semilogy(t, [max(r["p99_ms"], 0.1) for r in sec], color=C2, lw=1.2, label="клієнт p99 за секунду")
-    pts = []
-    for k in range(0, int(len(sec)) - 5, 5):
-        q = quantile(p, t0 + k, t0 + k + 5)
+    ax[0].set_ylabel("req/s"); ax[0].legend(frameon=False, ncol=4, fontsize=8); ax[0].set_title(f"N={n}: по секундах")
+    ax[1].semilogy(t, [max(r["p99_ms"], 0.1) if r["p99_ms"] is not None else float("nan") for r in sec],
+                   color=C2, lw=1.2, label="клієнт p99 за секунду")
+    # сервер: вікно 15 с, оновлення кожні 5 с -> відрізки [t0+k, t0+k+15], k = 0, 5, 10, ...
+    xs, ys, ox, oy = [], [], [], []
+    for k in range(0, T - 15 + 1, 5):
+        q = quantile(p, t0 + k, t0 + k + 15)
         if q:
-            pts.append((k + 2.5, q[0] * 1000))
-    ax[1].plot([a for a, _ in pts], [b for _, b in pts], color=C1, marker="s", lw=1.6, label="сервер p99 за 5 с")
-    ax[1].set_ylabel("мс"); ax[1].legend(frameon=False, fontsize=8)
-    cpu = web(p["series"]["cpu_seconds"])
-    for i, c in enumerate(cpu):
-        xs, ys = [], []
-        for k in range(0, len(sec) - 5, 5):
-            xs.append(k + 2.5); ys.append((interp(c, t0 + k + 5) - interp(c, t0 + k)) / 5)
-        ax[2].plot(xs, ys, lw=1.4, label=f"web-{i + 1}")
-    ax[2].axhline(1.0, color="#9a9993", ls="--", lw=1); ax[2].set_ylabel("CPU, ядер"); ax[2].set_xlabel("секунда прогону"); ax[2].legend(frameon=False, ncol=4, fontsize=8)
+            (ox if q[3] else xs).append(k + 15)          # точка - кінець вікна (момент, коли значення стає відоме)
+            (oy if q[3] else ys).append(1000.0 if q[3] else q[0] * 1000)
+    ax[1].plot(xs, ys, color=C1, marker="s", lw=0, ms=4, label="сервер p99, вікно 15 с, крок 5 с")
+    if ox:
+        ax[1].plot(ox, oy, color=C1, marker="^", lw=0, ms=6, mfc="none", label="сервер p99 > 1000 мс")
+    ax[1].set_ylabel("мс"); ax[1].legend(frameon=False, fontsize=8, ncol=3)
+    cpu = by_instance(p["series"]["cpu_seconds"]); req = by_instance(p["series"]["requests_total"])
+    inp = by_instance(p["series"]["in_progress"])
+    names = {inst: f"web-{i + 1} ({inst.split(':')[0]})" for i, inst in enumerate(cpu)}
+    cols = [C1, C2, C3, "#6250d6", "#9a6700", "#c2185b"]
+    for i, (inst, ser) in enumerate(cpu.items()):
+        xs = list(range(5, T + 1, 5))
+        ax[2].plot(xs, [(interp(ser[0], t0 + k) - interp(ser[0], t0 + k - 5)) / 5 for k in xs], lw=1.4, color=cols[i % 6], label=names[inst])
+        if inst in req:
+            ax[3].plot(xs, [sum(interp(x, t0 + k) - interp(x, t0 + k - 5) for x in req[inst]) / 5 for k in xs],
+                       lw=1.4, color=cols[i % 6], label=names[inst])
+        if inst in inp:
+            pts = [(v[0] - t0, float(v[1])) for v in inp[inst][0] if 0 <= v[0] - t0 <= T]
+            ax[4].plot([a for a, _ in pts], [b for _, b in pts], lw=1.2, marker="o", ms=2.5, color=cols[i % 6], label=names[inst])
+    ax[2].axhline(1.0, color="#9a9993", ls="--", lw=1); ax[2].set_ylabel("CPU, ядер"); ax[2].legend(frameon=False, ncol=4, fontsize=8)
+    ax[2].set_title("CPU кожного інстанса (приріст process_cpu_seconds_total за 5 с)", fontsize=9)
+    ax[3].set_ylabel("запитів/с"); ax[3].legend(frameon=False, ncol=4, fontsize=8)
+    ax[3].set_title("запити за секунду кожного інстанса (приріст http_requests_total за 5 с)", fontsize=9)
+    ax[4].set_ylabel("у польоті"); ax[4].set_xlabel("секунда прогону"); ax[4].legend(frameon=False, ncol=4, fontsize=8)
+    ax[4].set_title("запити в обробці кожного інстанса (http_requests_in_progress, відліки скрейпу)", fontsize=9)
     for a in ax:
-        for k in range(10, len(sec), 20):
+        for k in range(10, T, 20):
             a.axvline(k, color="#e6e5e1", lw=0.8, zorder=0)
     fig.tight_layout(); fig.savefig(out / f"timeline_N{n}.png"); plt.close(fig)
 
@@ -276,24 +320,26 @@ def plot_cpu_per_req(runs, out):
     ax.legend(frameon=False); fig.tight_layout(); fig.savefig(out / "cpu_per_request.png"); plt.close(fig)
 
 
-# ---------------------------------------------------------------- CPU хоста (typeperf)
+# ---------------------------------------------------------------- CPU хоста (семплер CPU)
 def parse_typeperf(path, tz_offset_h):
-    """Рядки "MM/DD/YYYY HH:MM:SS.mmm","значення" (локальний час) -> [(epoch_utc, %)]."""
+    """Рядки "MM/DD/YYYY HH:MM:SS.mmm","знач1","знач2",... (локальний час) -> [(epoch_utc, [знач...])]."""
     rows = []
-    for line in Path(path).read_text(encoding="utf-8", errors="ignore").splitlines():
-        m = re.match(r'"(\d+)/(\d+)/(\d+) (\d+):(\d+):(\d+)\.(\d+)","([\d.]+)"', line)
+    for line in Path(path).read_text(encoding="utf-8-sig", errors="ignore").splitlines():
+        m = re.match(r'"(\d+)/(\d+)/(\d+) (\d+):(\d+):(\d+)\.(\d+)"((?:,"[\d.]*")+)', line)
         if m:
-            mo, da, y, h, mi, sec, ms, v = m.groups()
+            mo, da, y, h, mi, sec, ms, rest = m.groups()
             t = datetime(int(y), int(mo), int(da), int(h), int(mi), int(sec), int(ms) * 1000)
-            rows.append(((t - datetime(1970, 1, 1)).total_seconds() - tz_offset_h * 3600, float(v)))
+            vals = [float(v) if v else float("nan") for v in re.findall(r'"([\d.]*)"', rest)]
+            rows.append(((t - datetime(1970, 1, 1)).total_seconds() - tz_offset_h * 3600, vals))
     return rows
 
 
-def host_cpu_steps(rows, start, warmup=10, step_s=20, transient=5, nsteps=7):
+def host_cpu_steps(rows, start, warmup=10, step_s=20, transient=5, nsteps=7, col=0, cols=None):
+    """Середнє і максимум за вікном сходинки (останні 15 с). col - один стовпець; cols - середнє за кількома."""
     out = []
     for k in range(1, nsteps + 1):
         a = start + warmup + step_s * (k - 1) + transient; b = start + warmup + step_s * k
-        x = [v for t, v in rows if a <= t < b]
+        x = [(sum(v[c] for c in cols) / len(cols)) if cols else v[col] for t, v in rows if a <= t < b]
         out.append(dict(step=k, target=200 * k, n=len(x), mean=sum(x) / len(x) if x else None, max=max(x) if x else None))
     return out
 
@@ -305,8 +351,11 @@ def plot_host_cpu(rows, start, steps, achieved, out, warmup=10, step_s=20):
         ax[0].hlines(achieved[k], x0, x0 + step_s, color=C1, lw=3, label="досягнуто (середнє за сходинку)" if k == 0 else None)
         ax[0].hlines(200 * (k + 1), x0, x0 + step_s, color="#9a9993", ls="--", lw=1.2, label="задано" if k == 0 else None)
     ax[0].set_ylabel("req/s"); ax[0].set_title("N=4: інтенсивність і завантаження процесора хоста", loc="left"); ax[0].legend(frameon=False, fontsize=8, loc="upper left")
-    t = [r[0] - start for r in rows]; v = [r[1] for r in rows]
-    ax[1].plot(t, v, color=C2, lw=1.8, label="CPU хоста, %")
+    t = [r[0] - start for r in rows]; v = [r[1][0] for r in rows]
+    ax[1].plot(t, v, color=C2, lw=1.8, label="CPU хоста, усі логічні ядра, %")
+    if rows and len(rows[0][1]) > 1:   # окремі ядра стенда (Docker VM), якщо їх знято
+        vm = [sum(r[1][1:]) / (len(r[1]) - 1) for r in rows]
+        ax[1].plot(t, vm, color=C3, lw=1.4, label="ядра стенда (Docker VM), сер. %")
     ax[1].axhline(100, color="#9a9993", ls="--", lw=1.2)
     for k, st in enumerate(steps):
         if st["mean"] is not None:
@@ -319,13 +368,41 @@ def plot_host_cpu(rows, start, steps, achieved, out, warmup=10, step_s=20):
 
 
 # ---------------------------------------------------------------- main
+def uk(v, d=1):
+    """Число з десятковою комою для таблиць звіту."""
+    return "—" if v is None else f"{v:.{d}f}".replace(".", ",")
+
+
+def usl_markdown(Ns, X, C, sg, kp, nstar, note, det):
+    R, S = det["rows"], det["S"]
+    L = ["### Розрахунок USL (метод найменших квадратів)\n",
+         "C(N) = X(N)/X(1); y(N) = N/C(N) − 1; u(N) = N − 1; v(N) = N(N − 1). Модель y = σ·u + κ·v (N = 1 дає нулі й не впливає).\n",
+         "| N | X(N), req/s | C(N) | y(N) | u(N) | v(N) |", "|---|---|---|---|---|---|"]
+    for n, x, c in zip(Ns, X, C):
+        if n == 1:
+            L.append(f"| 1 | {uk(x, 2)} | {uk(c, 4)} | 0 | 0 | 0 |")
+        else:
+            r = [q for q in R if q["N"] == n][0]
+            L.append(f"| {n} | {uk(x, 2)} | {uk(c, 4)} | {uk(r['y'], 4)} | {r['u']} | {r['v']} |")
+    L += ["", "Суми за N = 2, 3, 4:\n",
+          "| Σu² | Σv² | Σuv | Σuy | Σvy |", "|---|---|---|---|---|",
+          f"| {S['uu']} | {S['vv']} | {S['uv']} | {uk(S['uy'], 4)} | {uk(S['vy'], 4)} |", ""]
+    L += ["Нормальні рівняння: σ·Σu² + κ·Σuv = Σuy;  σ·Σuv + κ·Σv² = Σvy. Розв'язок за правилом Крамера:\n",
+          f"- Δ = Σu²·Σv² − (Σuv)² = {S['uu']}·{S['vv']} − {S['uv']}² = {uk(det['det'], 0)}",
+          f"- σ = (Σuy·Σv² − Σvy·Σuv)/Δ = ({uk(S['uy'], 4)}·{S['vv']} − {uk(S['vy'], 4)}·{S['uv']})/{uk(det['det'], 0)} = {uk(det['sg_raw'], 4)}",
+          f"- κ = (Σu²·Σvy − Σuv·Σuy)/Δ = ({S['uu']}·{uk(S['vy'], 4)} − {S['uv']}·{uk(S['uy'], 4)})/{uk(det['det'], 0)} = {uk(det['kp_raw'], 5)}", ""]
+    L.append(f"Підсумок ({note}): **σ = {uk(sg, 4)}, κ = {uk(kp, 5)}**, "
+             + (f"N* = √((1 − σ)/κ) = {uk(nstar, 2)}." if not math.isinf(nstar) else "κ = 0, тому N* = ∞."))
+    return "\n".join(L)
+
+
 def main():
+    here = Path(__file__).resolve().parent
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default="data"); ap.add_argument("--out", default="out"); ap.add_argument("--pool", type=int, default=10)
-    ap.add_argument("--host-cpu", default="host_cpu_4web.txt", help="вивід typeperf під час прогону N=4 (у --data)")
-    ap.add_argument("--host-start", default="2026-10-29T00:40:18+00:00", help="мітка «Старт» цього прогону (UTC)")
-    ap.add_argument("--host-tz", type=float, default=2.0, help="зсув локального часу typeperf відносно UTC, год")
-    ap.add_argument("--host-achieved", default="200.07,400.07,600.13,800.4,999.6,692.4,260.87", help="досягнуто по сходинках цього прогону")
+    ap.add_argument("--data", default=str(here.parent / "results"), help="каталог з step_*.json, prom_*.json, docker stats, host_cpu_4web.txt")
+    ap.add_argument("--out", default=str(here / "out")); ap.add_argument("--pool", type=int, default=10)
+    ap.add_argument("--host-cpu", default="host_cpu_4web.txt", help="вивід семплера CPU під час прогону N=4 (у --data)")
+    ap.add_argument("--host-tz", type=float, default=2.0, help="зсув локального часу семплера CPU відносно UTC, год (Київ узимку = 2)")
     a = ap.parse_args()
     data, out = Path(a.data), Path(a.out); out.mkdir(exist_ok=True)
     style()
@@ -333,55 +410,111 @@ def main():
     Ns = [1, 2, 3, 4]
     X = [x_of(runs[n][0])[0] for n in Ns]; Xs = [x_of(runs[n][0])[1] for n in Ns]
     C = [x / X[0] for x in X]
-    sg, kp, nstar, note = usl_fit(Ns, C)
-    G = json.load(open(data / "step_noop.json"))["summary"]["X"]
+    sg, kp, nstar, note, det = usl_fit(Ns, C)
+    G = json.load(open(data / "step_noop.json", encoding="utf-8"))["summary"]["X"]
     summary = dict(X=dict(zip(Ns, X)), X_std=dict(zip(Ns, Xs)), C=dict(zip(Ns, C)), sigma=sg, kappa=kp,
-                   N_star=None if math.isinf(nstar) else nstar, fit_note=note, G=G)
+                   N_star=None if math.isinf(nstar) else nstar, fit_note=note, G=G,
+                   usl_sums=det["S"], usl_rows=det["rows"], sigma_raw=det["sg_raw"], kappa_raw=det["kp_raw"])
     summary["usl_C"] = {n: usl(n, sg, kp) for n in Ns}
-    # похибка квантування сходинки 200 req/s
     summary["quantization"] = "X(N) визначено з кроком сходинки 200 req/s: істинна межа в [X; X+200)"
-    for n in Ns:
-        plot_timeline(n, runs[n][0], runs[n][1], out) if n in (1, 4) else None
-        if n in (1, 4):
-            plot_profile(n, runs[n][0], runs[n][1], runs[n][2], out)
+    summary["sent_equals_target_all_steps"] = {n: runs[n][0]["summary"].get("sent_equals_target_all_steps") for n in Ns}
+    summary["sched_lag_p99_ms"] = {n: runs[n][0]["summary"].get("sched_lag_p99_ms") for n in Ns}
+    for n in (1, 4):
+        plot_timeline(n, runs[n][0], runs[n][1], out)
+        plot_profile(n, runs[n][0], runs[n][1], runs[n][2], out)
     plot_xn(Ns, X, Xs, sg, kp, out); plot_m2(runs, a.pool, out); plot_cpu_per_req(runs, out)
-    # docker stats
+
+    s4 = runs[4][0]
+    t_a, t_b = s4["start_epoch"], s4["end_epoch"]
+    xst = [st for st in s4["steps"] if st["step"] == s4["summary"]["X_step"]][0]
+    # docker stats: лише відліки з вікна 15 с сходинки X(4) ТОГО САМОГО прогону
+    checks = []
     ds = data / "docker_stats_4web.txt"
+    docker_md = ""
     if ds.exists():
-        samples = parse_stats(ds); s4 = runs[4][0]
-        st5 = [st for st in s4["steps"] if st["step"] == 5][0]
-        a0, b0 = s4["start_epoch"] + st5["window_from_s"] - 1, s4["start_epoch"] + st5["window_to_s"]
+        samples = parse_stats(ds)
+        inside_run = [x for x in samples if t_a <= x["t"] <= t_b]
+        a0, b0 = t_a + xst["window_from_s"], t_a + xst["window_to_s"]
         sel = [x for x in samples if a0 <= x["t"] <= b0]
-        names = sorted({k for x in sel for k in x["cpu"]})
-        mean = {k: sum(x["cpu"].get(k, 0) for x in sel) / len(sel) for k in names}
-        summary["docker_stats_X4"] = dict(samples=len(sel), mean_cpu_pct=mean, sum_cores=sum(mean.values()) / 100,
-                                         web_cores=sum(v for k, v in mean.items() if "web" in k) / 100,
-                                         gen_mb=sum(x.get("gen_mb", 0) for x in sel) / len(sel))
+        summary["docker_stats_check"] = dict(samples_total=len(samples), samples_inside_run=len(inside_run), samples_in_X_window=len(sel),
+                                             first=datetime.fromtimestamp(samples[0]["t"], timezone.utc).isoformat() if samples else None,
+                                             last=datetime.fromtimestamp(samples[-1]["t"], timezone.utc).isoformat() if samples else None,
+                                             run_start=s4["started_utc"])
+        if not sel:
+            checks.append(f"УВАГА: docker stats ({summary['docker_stats_check']['first']} … {summary['docker_stats_check']['last']}) "
+                          f"не перетинається з вікном сходинки X(4) прогону N=4 ({datetime.fromtimestamp(a0, timezone.utc).isoformat()}): "
+                          "знімок з іншого прогону - перезніміть docker stats разом із прогоном.")
+        else:
+            names = sorted({k for x in sel for k in x["cpu"]})
+            mean = {k: sum(x["cpu"].get(k, 0) for x in sel) / len(sel) for k in names}
+            summary["docker_stats_X4"] = dict(samples=len(sel), window_utc=[datetime.fromtimestamp(a0, timezone.utc).isoformat(), datetime.fromtimestamp(b0, timezone.utc).isoformat()],
+                                             mean_cpu_pct=mean, sum_cores=sum(mean.values()) / 100,
+                                             web_cores=sum(v for k, v in mean.items() if "web" in k) / 100)
+            D = [f"\n### docker stats на сходинці X(4) (сходинка {xst['step']}, {xst['target_rps']} req/s, вікно 15 с, {len(sel)} відліків)\n",
+                 "| Контейнер | CPU, % від одного ядра |", "|---|---|"]
+            for k in names:
+                D.append(f"| {k} | {uk(mean[k], 1)} |")
+            D.append(f"| Усього | ≈ {uk(sum(mean.values()) / 100, 2)} ядра (web ≈ {uk(summary['docker_stats_X4']['web_cores'], 2)}) |")
+            gc = xst.get("generator_cpu_cores")
+            D.append(f"\nПроцеси генератора на цій же сходинці: {uk(gc, 2) + ' ядра' if gc is not None else 'немає у файлі результатів (прогін зроблено старою версією генератора)'}.")
+            docker_md = "\n".join(D)
     hc = data / a.host_cpu
+    if not hc.exists() and (data.parent / "analysis" / "data" / a.host_cpu).exists():
+        hc = data.parent / "analysis" / "data" / a.host_cpu
+    host_md = ""
     if hc.exists():
-        start = datetime.fromisoformat(a.host_start).timestamp()
-        hrows = parse_typeperf(hc, a.host_tz); hsteps = host_cpu_steps(hrows, start)
-        ach = [float(x) for x in a.host_achieved.split(",")]
-        plot_host_cpu(hrows, start, hsteps, ach, out)
-        summary["host_cpu_N4"] = [dict(h, achieved=ach[i] if i < len(ach) else None) for i, h in enumerate(hsteps)]
-        T = ["\n### CPU хоста при N=4 (typeperf, вікно: останні 15 с сходинки)\n", "| сх. | задано | досягнуто | CPU хоста, сер. % | макс. % |", "|---|---|---|---|---|"]
+        cfg = s4["config"]
+        hrows = parse_typeperf(hc, a.host_tz)
+        hsteps = host_cpu_steps(hrows, t_a, cfg["warmup_s"], cfg["step_s"], cfg["transient_s"], len(s4["steps"]))
+        ncol = len(hrows[0][1]) if hrows else 1
+        vsteps = host_cpu_steps(hrows, t_a, cfg["warmup_s"], cfg["step_s"], cfg["transient_s"], len(s4["steps"]), cols=list(range(1, ncol))) if ncol > 1 else None
+        ach = [st["achieved_rps_mean"] for st in s4["steps"]]
+        inside = [r for r in hrows if t_a <= r[0] <= t_b]
+        summary["host_cpu_check"] = dict(samples=len(hrows), samples_inside_run=len(inside), columns=ncol)
+        if not inside:
+            checks.append("УВАГА: файл CPU хоста не перетинається з прогоном N=4 за часом (перевірте --host-tz і що results/host_cpu_4web.txt знято на цьому прогоні).")
+        plot_host_cpu(hrows, t_a, hsteps, ach, out, cfg["warmup_s"], cfg["step_s"])
+        summary["host_cpu_N4"] = [dict(h, achieved=ach[i] if i < len(ach) else None, vm_cores_mean=(vsteps[i]["mean"] if vsteps else None)) for i, h in enumerate(hsteps)]
+        hdr = "| сх. | задано | досягнуто | CPU хоста (усі ядра), сер. % | макс. % |" + (" ядра стенда 0–3, сер. % |" if vsteps else "")
+        T = ["\n### CPU хоста при N=4 (scripts/host_cpu_loop.ps1, вікно: останні 15 с сходинки)\n", hdr, "|---|---|---|---|---|" + ("---|" if vsteps else "")]
         for i, h in enumerate(hsteps):
-            T.append(f"| {h['step']} | {h['target']} | {ach[i]:.1f} | {h['mean']:.1f} | {h['max']:.0f} |")
+            if h["mean"] is not None:
+                T.append(f"| {h['step']} | {h['target']} | {uk(ach[i], 1)} | {uk(h['mean'], 1)} | {h['max']:.0f} |" + (f" {uk(vsteps[i]['mean'], 1)} |" if vsteps else ""))
         host_md = "\n".join(T)
-    else:
-        host_md = ""
-    json.dump(summary, open(out / "summary.json", "w"), ensure_ascii=False, indent=1, default=str)
-    # таблиці
-    L = []
+    json.dump(summary, open(out / "summary.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1, default=str)
+
+    # ---- таблиці для звіту
+    L = ["### X(N)\n", "| N | X(N), req/s | σ по секундах | остання сходинка ≥ 0,9·задана? | X ≥ 0,9·G? | надіслано = задано на всіх сходинках? | запізнення планувальника p99, мс |", "|---|---|---|---|---|---|---|"]
     for n in Ns:
-        L.append(f"\n### N={n}\n\n| сх. | задано | досягнуто ± σ | не-2xx % | p99 клієнт | p99 сервер (межі) | CPU/інст. (сер/макс) | in-flight | pg act/idle | tx/с | CPU-мс/запит |\n|---|---|---|---|---|---|---|---|---|---|---|")
+        sm = runs[n][0]["summary"]
+        L.append(f"| {n} | {uk(sm['X'], 1)} | {uk(sm['X_std'], 1)} | {'так' if sm['last_step_reached_0_9'] else 'ні'} | {'так' if sm.get('X_ge_0_9_g') else 'ні'} "
+                 f"| {'так' if sm.get('sent_equals_target_all_steps') else ('ні' if sm.get('sent_equals_target_all_steps') is False else 'н/д')} | {uk(sm.get('sched_lag_p99_ms'), 0)} |")
+    L.append(f"\nG = {uk(G, 1)} req/s.\n")
+    for n in Ns:
+        L.append(f"\n### N={n}\n\n| сх. | задано | надіслано | досягнуто ± σ | не-2xx % | p99 клієнт | p99 сервер (межі, похибка) | CPU/інст. (сер/макс) | in-flight | pg act/idle | tx/с | CPU-мс/запит | CPU генер., ядер |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|")
         for r in runs[n][2]:
-            sv = "—" if r["srv_p99"] is None else (f"> 1000" if r["srv_open"] else f"{r['srv_p99']:.1f} [{r['srv_lo']:.0f}–{r['srv_hi']:.0f}]")
-            f = lambda v, d=1: "—" if v is None else f"{v:.{d}f}"
-            L.append(f"| {r['step']} | {r['target']} | {r['achieved']:.1f} ± {r['std']:.1f} | {r['non2xx_pct']} | {r['client_p99']} | {sv} | {r['cpu_per_inst']:.2f}/{r['cpu_max']:.2f} | {f(r['inprog_mean'])}/{f(r['inprog_max'],0)} | {f(r['pg_active'])}/{f(r['pg_idle'])} | {r['pg_tps']:.0f} | {f(r['cpu_ms_per_req'],2)} |")
-    (out / "tables.md").write_text("\n".join(L) + host_md, encoding="utf-8")
-    json.dump({n: runs[n][2] for n in Ns}, open(out / "rows.json", "w"), ensure_ascii=False, indent=1, default=str)
-    print(json.dumps(summary, ensure_ascii=False, indent=1, default=str))
+            if r["srv_p99"] is None:
+                sv = "—"
+            elif r["srv_open"]:
+                sv = "> 1000 мс"
+            else:
+                sv = f"{uk(r['srv_p99'], 1)} [{r['srv_lo']:.0f}; {r['srv_hi']:.0f}], ±{r['srv_err']:.0f}"
+            L.append(f"| {r['step']} | {r['target']} | {uk(r['sent'], 1)} | {uk(r['achieved'], 1)} ± {uk(r['std'], 1)} | {uk(r['non2xx_pct'], 1)} | {uk(r['client_p99'], 1)} | {sv} | "
+                     f"{uk(r['cpu_per_inst'], 2)}/{uk(r['cpu_max'], 2)} | {uk(r['inprog_mean'], 1)}/{uk(r['inprog_max'], 0)} | {uk(r['pg_active'], 1)}/{uk(r['pg_idle'], 1)} | {r['pg_tps']:.0f} | {uk(r['cpu_ms_per_req'], 2)} | {uk(r['gen_cpu'], 2)} |")
+    L.append("\n### p99 клієнта і сервера, N=1\n\n| сх. | задано | p99 клієнт, мс | p99 сервер, мс | межі бакета, мс | похибка (ширина бакета), мс |\n|---|---|---|---|---|---|")
+    for r in runs[1][2]:
+        if r["srv_p99"] is None:
+            L.append(f"| {r['step']} | {r['target']} | {uk(r['client_p99'], 1)} | немає відповідей сервера у вікні | — | — |")
+        elif r["srv_open"]:
+            L.append(f"| {r['step']} | {r['target']} | {uk(r['client_p99'], 1)} | > 1000 | (1000; +∞) | — |")
+        else:
+            L.append(f"| {r['step']} | {r['target']} | {uk(r['client_p99'], 1)} | {uk(r['srv_p99'], 1)} | [{r['srv_lo']:.0f}; {r['srv_hi']:.0f}] | {r['srv_err']:.0f} |")
+    L.append("\n" + usl_markdown(Ns, X, C, sg, kp, nstar, note, det))
+    (out / "tables.md").write_text("\n".join(L) + "\n" + docker_md + "\n" + host_md + "\n" + ("\n".join(["", "### Перевірки"] + checks) if checks else ""), encoding="utf-8")
+    json.dump({n: runs[n][2] for n in Ns}, open(out / "rows.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1, default=str)
+    for c in checks:
+        print(c)
+    print(json.dumps({k: summary[k] for k in ("X", "X_std", "sigma", "kappa", "N_star", "fit_note")}, ensure_ascii=False, indent=1, default=str))
 
 
 if __name__ == "__main__":
